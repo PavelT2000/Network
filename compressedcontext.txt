@@ -1,0 +1,339 @@
+=== PROJECT HIERARCHY ===
+├── .aiignore
+├── .gitignore
+├── OnlineChat
+│   ├── .vscode
+│   │   └── launch.json
+│   ├── CMakeLists.txt
+│   ├── config.txt
+│   ├── include
+│   │   └── Listener.h
+│   └── src
+│       ├── Listener.cpp
+│       └── main.cpp
+└── Test Work
+    ├── Client
+    │   └── main.cpp
+    └── Server
+        ├── config.txt
+        └── main.cpp
+
+=== SOURCE CODE ===
+
+--- FILE: OnlineChat/CMakeLists.txt ---
+cmake_minimum_required(VERSION 3.10)
+
+project(OnlineChat)
+
+# Указываем стандарт C++
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+file(GLOB SOURCES "src/*.cpp")
+
+# Создаем исполняемый файл
+add_executable(OnlineChat ${SOURCES})
+target_include_directories(OnlineChat PRIVATE include)
+# Важнейшая часть для Windows: подключаем библиотеку WinSock2
+if(WIN32)
+    target_link_libraries(OnlineChat ws2_32)
+endif()
+
+--- FILE: OnlineChat/config.txt ---
+8080
+
+--- FILE: OnlineChat/include/Listener.h ---
+#ifndef LISTENER_H
+#define LISTENER_H
+
+#include <winsock2.h>
+
+struct ThreadArgs {
+    int port;
+    bool* isRunning;
+};
+
+// Функция самого потока
+DWORD WINAPI UDPListenerThread(LPVOID lpParam);
+
+// Удобная обертка для запуска из main
+void startListener();
+
+#endif
+
+--- FILE: OnlineChat/src/Listener.cpp ---
+#include "Listener.h"
+#include <iostream>
+#include <string>
+#include <ws2tcpip.h>
+
+#pragma comment(lib, "ws2_32.lib")
+
+bool isRunning = true;
+ThreadArgs args = { 8080, &isRunning };
+
+void startListener() {
+    CreateThread(NULL, 0, UDPListenerThread, &args, 0, NULL);
+}
+
+DWORD WINAPI UDPListenerThread(LPVOID lpParam) {
+    ThreadArgs* args = (ThreadArgs*)lpParam;
+    int port = args->port;
+
+    // 1. Создаем UDP сокет (SOCK_DGRAM)
+    SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udpSocket == INVALID_SOCKET) {
+        std::cerr << "[Listener] Socket error: " << WSAGetLastError() << std::endl;
+        return 1;
+    }
+
+    // 2. Настраиваем адрес для прослушивания
+    sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY; // Слушать все интерфейсы
+    serverAddr.sin_port = htons((unsigned short)port);
+
+    // 3. Привязываем сокет к порту
+    if (bind(udpSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+        std::cerr << "[Listener] Bind error: " << WSAGetLastError() << std::endl;
+        closesocket(udpSocket);
+        return 1;
+    }
+
+    std::cout << "[UDP Listener] Active on port " << port << ". Listening for broadcast...\n";
+
+    char buffer[1024];
+    sockaddr_in clientAddr; // Сюда запишется адрес отправителя
+    int clientLen = sizeof(clientAddr);
+
+    // 4. Бесконечный цикл прослушивания
+    while (*(args->isRunning)) {
+        // Очищаем буфер
+        memset(buffer, 0, sizeof(buffer));
+
+        // recvfrom блокирует поток до получения любого UDP пакета
+        int bytesReceived = recvfrom(udpSocket, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&clientAddr, &clientLen);
+
+        if (bytesReceived > 0) {
+            buffer[bytesReceived] = '\0';
+
+            // Преобразуем IP отправителя в строку
+            char remoteIP[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &clientAddr.sin_addr, remoteIP, INET_ADDRSTRLEN);
+
+            std::cout << "\r\033[K[Received from " << remoteIP << "]: " << buffer << std::endl;
+            std::cout << "> " << std::flush;
+        } 
+        else if (bytesReceived == SOCKET_ERROR) {
+            int error = WSAGetLastError();
+            // Если ошибка не связана с закрытием сокета, выводим её
+            if (error != WSAEINTR) {
+                std::cerr << "[Listener] Recv error: " << error << std::endl;
+            }
+            break;
+        }
+    }
+
+    std::cout << "[Listener] Stopping...\n";
+    closesocket(udpSocket);
+    return 0;
+}
+
+--- FILE: OnlineChat/src/main.cpp ---
+#include <iostream>
+#include <string>
+#include <thread>
+#include <winsock2.h>
+#include "Listener.h"
+
+#pragma comment(lib, "ws2_32.lib")
+
+void sendMessage(const std::string& text) {
+    SOCKET sendSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    
+    BOOL broadcast = TRUE;
+    setsockopt(sendSock, SOL_SOCKET, SO_BROADCAST, (char*)&broadcast, sizeof(broadcast));
+
+    sockaddr_in recvAddr;
+    recvAddr.sin_family = AF_INET;
+    recvAddr.sin_port = htons(8080);
+    recvAddr.sin_addr.s_addr = inet_addr("255.255.255.255");
+
+    sendto(sendSock, text.c_str(), text.length(), 0, (sockaddr*)&recvAddr, sizeof(recvAddr));
+    closesocket(sendSock);
+}
+
+int main() {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwMode = 0;
+    if (GetConsoleMode(hOut, &dwMode)) {
+        dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        SetConsoleMode(hOut, dwMode);
+    }
+    // Инициализация WinSock
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    // Запуск слушателя в фоне
+    std::thread listenerThread(startListener);
+    listenerThread.detach();
+
+    std::string input;
+    while (true) {
+        // ANSI код: Очистить текущую строку и поставить курсор в начало
+        std::cout << "\r\033[K> " << std::flush; 
+        
+        if (!std::getline(std::cin, input)) break;
+        if (input == "exit") break;
+
+        if (!input.empty()) {
+            sendMessage(input);
+        }
+    }
+
+    WSACleanup();
+    return 0;
+}
+
+--- FILE: Test Work/Client/main.cpp ---
+#include <winsock2.h>
+#include <ws2tcpip.h> // Для inet_pton
+#include <iostream>
+#include <string>
+
+#pragma comment(lib, "ws2_32.lib")
+
+int main() {
+    // 1. Инициализация WinSock
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed" << std::endl;
+        return 1;
+    }
+
+    // 2. Ввод данных для подключения
+    std::string ipAddress;
+    int port;
+    std::cout << "Enter Server IP (e.g. 127.0.0.1): ";
+    std::cin >> ipAddress;
+    std::cout << "Enter Port: ";
+    std::cin >> port;
+    std::cin.ignore(); // Очистка буфера после ввода числа
+
+    // 3. Создание сокета
+    SOCKET connectSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (connectSocket == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed" << std::endl;
+        WSACleanup();
+        return 1;
+    }
+
+    // 4. Настройка структуры адреса сервера
+    sockaddr_in clientService;
+    clientService.sin_family = AF_INET;
+    clientService.sin_port = htons((unsigned short)port);
+    inet_pton(AF_INET, ipAddress.c_str(), &clientService.sin_addr); // Преобразуем строку в IP
+
+    // 5. Подключение к серверу
+    std::cout << "Connecting..." << std::endl;
+    if (connect(connectSocket, (sockaddr*)&clientService, sizeof(clientService)) == SOCKET_ERROR) {
+        std::cerr << "Connection failed! Error: " << WSAGetLastError() << std::endl;
+        closesocket(connectSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    std::cout << "Connected! Type your message (or 'exit' to quit):" << std::endl;
+
+    // 6. Цикл отправки сообщений
+    std::string userInput;
+    while (true) {
+        std::cout << "> ";
+        std::getline(std::cin, userInput);
+
+        if (userInput == "exit") break;
+
+        int sendResult = send(connectSocket, userInput.c_str(), (int)userInput.length(), 0);
+        if (sendResult == SOCKET_ERROR) {
+            std::cerr << "Send failed: " << WSAGetLastError() << std::endl;
+            break;
+        }
+    }
+
+    // 7. Закрытие
+    closesocket(connectSocket);
+    WSACleanup();
+    return 0;
+}
+
+--- FILE: Test Work/Server/config.txt ---
+8080
+
+--- FILE: Test Work/Server/main.cpp ---
+#include <winsock2.h>
+#include <iostream>
+#include <fstream>
+#include <string>
+
+#pragma comment(lib, "ws2_32.lib")
+
+int main() {
+    // Чтение порта
+    int port = 0;
+    std::ifstream configFile("config.txt");
+    if (!(configFile >> port)) {
+        std::cerr << "Error: Config file not found or empty!" << std::endl;
+        return 1;
+    }
+
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    
+    sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons((unsigned short)port);
+
+    bind(listenSocket, (sockaddr*)&serverAddr, sizeof(serverAddr));
+    listen(listenSocket, SOMAXCONN);
+
+    std::cout << "Server is listening on port " << port << "..." << std::endl;
+
+    
+
+    while (true) {
+        sockaddr_in clientAddr;
+        int clientAddrSize = sizeof(clientAddr);
+        SOCKET clientSocket = accept(listenSocket, (sockaddr*)&clientAddr, &clientAddrSize);
+        
+        if (clientSocket != INVALID_SOCKET) {
+            std::cout << "[Client connected]" << std::endl;
+
+            // ВНУТРЕННИЙ ЦИКЛ: Общаемся с клиентом до победного
+            char buffer[1024];
+            while (true) {
+                int bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+                
+                if (bytesReceived > 0) {
+                    buffer[bytesReceived] = '\0';
+                    std::cout << "Client says: " << buffer << std::endl;
+                } 
+                else if (bytesReceived == 0) {
+                    std::cout << "[Client disconnected gracefully]" << std::endl;
+                    break; 
+                } 
+                else {
+                    std::cout << "[Connection error or closed]" << std::endl;
+                    break;
+                }
+            }
+            closesocket(clientSocket); // Закрываем только когда клиент ушел
+        }
+    }
+
+    closesocket(listenSocket);
+    WSACleanup();
+    return 0;
+}
